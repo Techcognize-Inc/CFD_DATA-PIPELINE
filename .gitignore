@@ -1,0 +1,18 @@
+# Spark cache
+spark/.ivy2/
+
+# Spark checkpoints
+checkpoints/
+
+# Dataset
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VSCode
+.vscode/
+
+# Logs
+*.log
