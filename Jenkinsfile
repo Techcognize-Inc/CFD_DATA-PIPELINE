@@ -14,39 +14,41 @@ pipeline {
 
         stage('Validate Python') {
             steps {
-                bat '''
-                python -m py_compile producer\\csv_replayer.py
-                python -m py_compile spark\\stream_features.py
-                python -m py_compile spark\\batch_rule_engine.py
+                sh '''
+                python3 -m py_compile producer/csv_replayer.py
+                python3 -m py_compile spark/stream_features.py
+                python3 -m py_compile spark/batch_rule_engine.py
+                python3 -m py_compile airflow/dags/fraud_rule_engine_dag.py
+                python3 -m py_compile airflow/dags/fraud_streaming_monitor_dag.py
                 '''
             }
         }
 
         stage('Validate Docker Compose') {
             steps {
-                bat '''
-                docker compose -f %COMPOSE_FILE% config
+                sh '''
+                docker compose -f ${COMPOSE_FILE} config
                 '''
             }
         }
 
         stage('Start Infra') {
             steps {
-                bat '''
-                docker compose -f %COMPOSE_FILE% up -d
+                sh '''
+                docker compose -f ${COMPOSE_FILE} up -d
                 '''
             }
         }
 
         stage('Wait for Services') {
             steps {
-                bat 'timeout /t 30'
+                sh 'sleep 30'
             }
         }
 
         stage('Initialize Database') {
             steps {
-                bat '''
+                sh '''
                 docker exec de2-postgres psql -U banking -d bankingdb -f /sql/init.sql
                 '''
             }
@@ -54,7 +56,7 @@ pipeline {
 
         stage('Smoke Check') {
             steps {
-                bat '''
+                sh '''
                 docker exec de2-postgres psql -U banking -d bankingdb -c "SELECT 1;"
                 '''
             }
