@@ -6,7 +6,7 @@ def test_alert_reason_both_conditions():
 
 
 def test_alert_reason_txn_only():
-    assert get_alert_reason(8, False) == "High txn count"
+    assert get_alert_reason(10, False) == "High txn count"
 
 
 def test_alert_reason_deviation_only():
@@ -18,11 +18,11 @@ def test_alert_reason_none():
 
 
 def test_amount_deviation_true():
-    assert is_amount_deviation(100, 10, 140) is True
+    assert is_amount_deviation(100, 10, 130) is True
 
 
 def test_amount_deviation_false():
-    assert is_amount_deviation(100, 10, 120) is False
+    assert is_amount_deviation(100, 10, 115) is False
 
 
 def test_amount_deviation_std_none():

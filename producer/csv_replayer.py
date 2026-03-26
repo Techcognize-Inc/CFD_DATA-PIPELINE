@@ -1,49 +1,54 @@
-import pandas as pd
 import json
 import time
-from kafka import KafkaProducer
 from datetime import datetime, timedelta
+import pandas as pd
+from kafka import KafkaProducer
 
-KAFKA_BOOTSTRAP = "localhost:9092"
 TOPIC = "raw.card.transactions"
+BOOTSTRAP_SERVERS = "localhost:9092"
 CSV_PATH = "data/creditcard.csv"
+BASE_TIME = datetime(2026, 3, 25, 19, 0, 0)
 
 
-def create_producer():
-    return KafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-    )
+def build_transaction(row, idx):
+    tx_time = BASE_TIME + timedelta(seconds=idx * 5)
 
+    if idx < 20:
+        card_id = "card_test_999"
+    else:
+        card_id = f"card_{idx % 5000}"
 
-def build_transaction(i, row, base_time):
+    if 5 <= idx < 10:
+        amount = 5000.0
+    else:
+        amount = float(row["Amount"])
+
     return {
-        "tx_id": f"tx_{i}",
-        "card_id": f"card_{i % 1000}",
-        "merchant_id": f"merchant_{i % 200}",
-        "amount": float(row["Amount"]),
-        "tx_time": (base_time + timedelta(seconds=int(row["Time"]))).isoformat(),
-        "fraud_label": int(row["Class"]),
+        "tx_id": f"tx_{idx}",
+        "card_id": card_id,
+        "merchant_id": f"merchant_{idx % 20}",
+        "amount": amount,
+        "tx_time": tx_time.isoformat(),
+        "fraud_label": int(row["Class"])
     }
 
 
 def main():
-    producer = create_producer()
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8")
+    )
+
     df = pd.read_csv(CSV_PATH)
-    base_time = datetime.now()
 
-    for i, row in df.iterrows():
-        tx = build_transaction(i, row, base_time)
-
-        producer.send(TOPIC, tx)
-
-        if i % 1000 == 0:
-            producer.flush()
-            print(f"Sent {i} transactions")
-
-        time.sleep(0.01)
+    for idx, row in df.head(50).iterrows():
+        payload = build_transaction(row, idx)
+        producer.send(TOPIC, value=payload)
+        print(f"Sent: {payload}")
+        time.sleep(0.2)
 
     producer.flush()
+    print("Completed replay.")
 
 
 if __name__ == "__main__":

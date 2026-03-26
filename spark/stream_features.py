@@ -6,27 +6,20 @@ from pyspark.sql.functions import (
     count,
     avg,
     stddev,
-    max as mx,
+    max as spark_max,
+    min as spark_min,
     when,
+    to_timestamp
 )
 from pyspark.sql.types import (
     StructType,
     StructField,
     StringType,
     DoubleType,
-    IntegerType,
+    IntegerType
 )
+import psycopg2
 
-# Internal Docker network addresses
-KAFKA_BOOTSTRAP = "de2-kafka:29092"
-TOPIC = "raw.card.transactions"
-
-PG_JDBC_URL = "jdbc:postgresql://de2-postgres:5432/bankingdb"
-PG_USER = "banking"
-PG_PASSWORD = "password"
-PG_DRIVER = "org.postgresql.Driver"
-
-STAGE_TABLE = "fraud.feature_store_stage"
 
 schema = StructType([
     StructField("tx_id", StringType(), True),
@@ -34,131 +27,124 @@ schema = StructType([
     StructField("merchant_id", StringType(), True),
     StructField("amount", DoubleType(), True),
     StructField("tx_time", StringType(), True),
-    StructField("fraud_label", IntegerType(), True),
+    StructField("fraud_label", IntegerType(), True)
 ])
 
 
-def call_upsert_function(spark: SparkSession) -> None:
-    jvm = spark._sc._gateway.jvm
-    jvm.java.lang.Class.forName(PG_DRIVER)
+def write_to_postgres(batch_df, batch_id):
+    print(f"\n========== Processing batch {batch_id} ==========")
 
-    props = jvm.java.util.Properties()
-    props.setProperty("user", PG_USER)
-    props.setProperty("password", PG_PASSWORD)
+    if batch_df.rdd.isEmpty():
+        print(f"Batch {batch_id} is empty")
+        return
 
-    conn = jvm.java.sql.DriverManager.getConnection(PG_JDBC_URL, props)
-    try:
-        stmt = conn.createStatement()
-        stmt.execute("SELECT fraud.upsert_feature_store();")
-        stmt.close()
-    finally:
-        conn.close()
+    batch_df.show(50, truncate=False)
+    rows = batch_df.collect()
 
-
-def write_batch(batch_df, batch_id: int, spark: SparkSession) -> None:
-    try:
-        if batch_df.isEmpty():
-            print(f"[INFO] Batch {batch_id} is empty. Skipping.")
-            return
-
-        print(f"[INFO] Writing batch {batch_id}")
-        batch_df.show(10, truncate=False)
-
-        (
-            batch_df.write
-            .mode("append")
-            .format("jdbc")
-            .option("url", PG_JDBC_URL)
-            .option("dbtable", STAGE_TABLE)
-            .option("user", PG_USER)
-            .option("password", PG_PASSWORD)
-            .option("driver", PG_DRIVER)
-            .save()
-        )
-
-        call_upsert_function(spark)
-        print(f"[INFO] Batch {batch_id} completed successfully.")
-
-    except Exception as e:
-        print(f"[ERROR] Batch {batch_id} failed: {e}")
-        raise
-
-
-def main() -> None:
-    spark = (
-        SparkSession.builder
-        .appName("de2-fraud-stream-features")
-        .master("spark://de2-spark-master:7077")
-        .getOrCreate()
+    conn = psycopg2.connect(
+        host="postgres",
+        port=5432,
+        database="bankingdb",
+        user="frauduser",
+        password="fraudpass"
     )
+    cur = conn.cursor()
 
-    spark.sparkContext.setLogLevel("WARN")
+    for row in rows:
+        cur.execute("""
+            INSERT INTO fraud.feature_store (
+                card_id,
+                window_start,
+                window_end,
+                txn_count_10min,
+                avg_amount_10min,
+                stddev_amount_10min,
+                max_amount_10min,
+                min_amount_10min,
+                amount_deviation_flag,
+                batch_id
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (card_id, window_start, window_end)
+            DO UPDATE SET
+                txn_count_10min = EXCLUDED.txn_count_10min,
+                avg_amount_10min = EXCLUDED.avg_amount_10min,
+                stddev_amount_10min = EXCLUDED.stddev_amount_10min,
+                max_amount_10min = EXCLUDED.max_amount_10min,
+                min_amount_10min = EXCLUDED.min_amount_10min,
+                amount_deviation_flag = EXCLUDED.amount_deviation_flag,
+                batch_id = EXCLUDED.batch_id
+        """, (
+            row["card_id"],
+            row["window_start"],
+            row["window_end"],
+            row["txn_count_10min"],
+            row["avg_amount_10min"],
+            row["stddev_amount_10min"],
+            row["max_amount_10min"],
+            row["min_amount_10min"],
+            row["amount_deviation_flag"],
+            batch_id
+        ))
 
-    raw = (
-        spark.readStream
-        .format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
-        .option("subscribe", TOPIC)
-        .option("startingOffsets", "earliest")
-        .load()
-    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    parsed = (
-        raw.selectExpr("CAST(value AS STRING) AS json_str")
-        .select(from_json(col("json_str"), schema).alias("e"))
-        .select(
-            col("e.card_id").alias("card_id"),
-            col("e.amount").cast("double").alias("amount"),
-            col("e.tx_time").cast("timestamp").alias("event_time"),
-        )
-        .where(
-            col("card_id").isNotNull()
-            & col("amount").isNotNull()
-            & col("event_time").isNotNull()
-        )
-        .withWatermark("event_time", "5 minutes")
-    )
-
-    features = (
-        parsed
-        .groupBy(
-            col("card_id"),
-            window(col("event_time"), "10 minutes", "1 minute").alias("w"),
-        )
-        .agg(
-            count("*").alias("txn_count_10min"),
-            avg("amount").alias("avg_amount_10min"),
-            stddev("amount").alias("std_amount_10min"),
-            mx("amount").alias("max_amount_10min"),
-        )
-        .select(
-            col("card_id"),
-            col("w.start").alias("window_start"),
-            col("w.end").alias("window_end"),
-            col("txn_count_10min").cast("int"),
-            col("avg_amount_10min"),
-            when(
-                (col("std_amount_10min").isNotNull()) & (col("std_amount_10min") > 0),
-                col("max_amount_10min") > (
-                    col("avg_amount_10min") + 3 * col("std_amount_10min")
-                ),
-            ).otherwise(False).alias("amount_deviation_flag"),
-        )
-    )
-
-    def foreach_batch(df, batch_id):
-        write_batch(df, batch_id, spark)
-
-    query = (
-        features.writeStream
-        .outputMode("update")
-        .foreachBatch(foreach_batch)
-        .option("checkpointLocation", "/opt/spark-apps/checkpoints/de2_features")
-        .start()
-    )
-
-    query.awaitTermination()
+    print(f"Batch {batch_id}: wrote {len(rows)} rows successfully")
 
 
-if __name__ == "__main__":
-    main()
+spark = SparkSession.builder \
+    .appName("fraud-feature-stream-windowed") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("WARN")
+
+raw_df = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", "kafka:29092") \
+    .option("subscribe", "raw.card.transactions") \
+    .option("startingOffsets", "earliest") \
+    .load()
+
+parsed_df = raw_df.selectExpr("CAST(value AS STRING) AS json_str") \
+    .select(from_json(col("json_str"), schema).alias("data")) \
+    .select("data.*") \
+    .withColumn("tx_time", to_timestamp("tx_time"))
+
+features_df = parsed_df.groupBy(
+    col("card_id"),
+    window(col("tx_time"), "1 minute")
+).agg(
+    count("*").alias("txn_count_10min"),
+    avg("amount").alias("avg_amount_10min"),
+    stddev("amount").alias("stddev_amount_10min"),
+    spark_max("amount").alias("max_amount_10min"),
+    spark_min("amount").alias("min_amount_10min")
+).withColumn(
+    "amount_deviation_flag",
+    when(
+        col("stddev_amount_10min").isNotNull() &
+        (col("stddev_amount_10min") > 0) &
+        (col("max_amount_10min") > col("avg_amount_10min") + 2 * col("stddev_amount_10min")),
+        True
+    ).otherwise(False)
+).select(
+    "card_id",
+    col("window.start").alias("window_start"),
+    col("window.end").alias("window_end"),
+    "txn_count_10min",
+    "avg_amount_10min",
+    "stddev_amount_10min",
+    "max_amount_10min",
+    "min_amount_10min",
+    "amount_deviation_flag"
+)
+
+query = features_df.writeStream \
+    .outputMode("complete") \
+    .foreachBatch(write_to_postgres) \
+    .option("checkpointLocation", "/opt/spark-apps/checkpoints") \
+    .start()
+
+query.awaitTermination()
